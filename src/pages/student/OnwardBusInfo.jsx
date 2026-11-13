@@ -27,7 +27,17 @@ export default function OnwardBusInfo() {
   });
 
   const handleRequestRideForBus = (bus) => {
-    navigate('/request-journey');
+    navigate('/request-journey', {
+      state: {
+        busNumber: bus.routeNumber,
+        pickupLocation: bus.connectingStops && bus.connectingStops.length > 0 ? bus.connectingStops[0] : 'Mavoor Road Bus Stand',
+        reason: bus.statusType === 'danger'
+          ? `Public Bus Breakdown (${bus.routeNumber})`
+          : `Connecting Bus Transit (${bus.routeNumber})`,
+        notes: `Connecting from ${bus.name} (${bus.routeNumber}). Scheduled departure: ${bus.nextScheduledDeparture}.`,
+        urgency: bus.statusType === 'danger' ? 'High' : 'Medium',
+      },
+    });
   };
 
   return (

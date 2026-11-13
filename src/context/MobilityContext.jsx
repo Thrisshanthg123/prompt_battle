@@ -12,15 +12,25 @@ import {
   INITIAL_VEHICLES,
   INITIAL_DISRUPTIONS,
   INITIAL_BUS_SCHEDULES,
+  INITIAL_ACTIVITY_LOGS,
+  INITIAL_ALLOCATIONS,
 } from './mockData';
 
 import { matchJourneyRequest } from '../services/matchingEngineInterface';
 
 import { broadcastDisruption } from '../services/disruptionEngineInterface';
 
+import {
+  handleVehicleBreakdown as runDisruptionWorkflow,
+  resolveVehicleBreakdown,
+} from '../services/disruptionService';
+
 const MobilityContext = createContext(null);
 
-// Safely read persisted application data.
+// --------------------------------------------------
+// SAFE LOCAL STORAGE
+// --------------------------------------------------
+
 const loadData = (key, fallback) => {
   try {
     const saved = localStorage.getItem(key);
@@ -31,38 +41,47 @@ const loadData = (key, fallback) => {
   }
 };
 
+// --------------------------------------------------
+// MOBILITY PROVIDER
+// --------------------------------------------------
+
 export function MobilityProvider({ children }) {
-  // 1. Student Profile
+  // --------------------------------------------------
+  // APPLICATION STATE
+  // --------------------------------------------------
+
   const [studentProfile, setStudentProfile] = useState(() =>
     loadData('sanchaari_student', DEFAULT_STUDENT_PROFILE)
   );
 
-  // 2. Student Journey Requests
   const [journeys, setJourneys] = useState(() =>
     loadData('sanchaari_journeys', INITIAL_JOURNEYS)
   );
 
-  // 3. Community Vehicles - Member 2
   const [vehicles, setVehicles] = useState(() =>
     loadData('sanchaari_vehicles', INITIAL_VEHICLES)
   );
 
-  // 4. Vehicle Allocations - Member 2
   const [allocations, setAllocations] = useState(() =>
-    loadData('sanchaari_allocations', [])
+    loadData('sanchaari_allocations', INITIAL_ALLOCATIONS)
   );
 
-  // 5. Transit Disruptions - Member 3
   const [disruptions, setDisruptions] = useState(() =>
     loadData('sanchaari_disruptions', INITIAL_DISRUPTIONS)
   );
 
-  // 6. Bus Schedules - Shared
   const [busSchedules, setBusSchedules] = useState(() =>
     loadData('sanchaari_buses', INITIAL_BUS_SCHEDULES)
   );
 
-  // 7. Notifications
+  const [activityLogs, setActivityLogs] = useState(() =>
+    loadData('sanchaari_activity_logs', INITIAL_ACTIVITY_LOGS)
+  );
+
+  const [lastDisruptionResult, setLastDisruptionResult] = useState(() =>
+    loadData('sanchaari_last_disruption', null)
+  );
+
   const [activeAlert, setActiveAlert] = useState(null);
 
   // --------------------------------------------------
@@ -111,6 +130,24 @@ export function MobilityProvider({ children }) {
     );
   }, [busSchedules]);
 
+  useEffect(() => {
+    localStorage.setItem(
+      'sanchaari_activity_logs',
+      JSON.stringify(activityLogs)
+    );
+  }, [activityLogs]);
+
+  useEffect(() => {
+    if (lastDisruptionResult) {
+      localStorage.setItem(
+        'sanchaari_last_disruption',
+        JSON.stringify(lastDisruptionResult)
+      );
+    } else {
+      localStorage.removeItem('sanchaari_last_disruption');
+    }
+  }, [lastDisruptionResult]);
+
   // --------------------------------------------------
   // ALERT SYSTEM
   // --------------------------------------------------
@@ -124,7 +161,53 @@ export function MobilityProvider({ children }) {
   };
 
   // --------------------------------------------------
+  // ACTIVITY LOGGING - MEMBER 3
+  // --------------------------------------------------
+
+  const addActivityLog = (logItem) => {
+    const newLog = {
+      id: logItem.id || `ACT-${Date.now().toString().slice(-4)}`,
+      timestamp: logItem.timestamp || new Date().toISOString(),
+      type: logItem.type || 'info',
+      title: logItem.title || 'System Event',
+      description: logItem.description || '',
+      severity: logItem.severity || 'info',
+    };
+
+    setActivityLogs((previous) => [newLog, ...previous]);
+  };
+
+  // --------------------------------------------------
+  // UPDATE REQUEST HELPER
+  // --------------------------------------------------
+
+  const updateRequest = (requestId, updates) => {
+    setJourneys((previous) =>
+      previous.map((request) =>
+        request.id === requestId
+          ? { ...request, ...updates }
+          : request
+      )
+    );
+  };
+
+  // --------------------------------------------------
+  // UPDATE ALLOCATION HELPER
+  // --------------------------------------------------
+
+  const updateAllocation = (allocationId, updates) => {
+    setAllocations((previous) =>
+      previous.map((allocation) =>
+        allocation.id === allocationId
+          ? { ...allocation, ...updates }
+          : allocation
+      )
+    );
+  };
+
+  // --------------------------------------------------
   // CREATE JOURNEY REQUEST - MEMBER 1
+  // MEMBER 2 MATCHING ENGINE
   // --------------------------------------------------
 
   const createJourneyRequest = async (requestData) => {
@@ -142,8 +225,13 @@ export function MobilityProvider({ children }) {
       studentId: studentProfile.id,
       studentName: studentProfile.name,
 
+      village: requestData.village || 'Kunnamangalam',
+
       pickupLocation: requestData.pickupLocation,
       destinationLocation: requestData.destinationLocation,
+
+      preferredJunction:
+        requestData.preferredJunction || 'Kunnamangalam Bus Bay',
 
       scheduledTime: requestData.scheduledTime || 'Immediate',
 
@@ -205,20 +293,24 @@ export function MobilityProvider({ children }) {
       ],
     };
 
-    // Save the student request first.
+    // Save the journey request.
     setJourneys((previous) => [
       newJourney,
       ...previous,
     ]);
 
+    addActivityLog({
+      type: 'request',
+      title: 'New Student Ride Requested',
+      description: `${studentProfile.name} requested travel from ${requestData.pickupLocation}`,
+      severity: 'info',
+    });
+
     showAlert(
       `Journey request ${newJourneyId} submitted successfully!`
     );
 
-    // ------------------------------------------------
-    // MEMBER 2 MATCHING ENGINE
-    // ------------------------------------------------
-
+    // Run the strict matching engine.
     try {
       const matchingResult = matchJourneyRequest(
         newJourney,
@@ -229,16 +321,16 @@ export function MobilityProvider({ children }) {
       if (matchingResult.match) {
         const match = matchingResult.match;
 
-        // Update vehicle seat availability.
+        // Update available vehicle seats.
         setVehicles(matchingResult.updatedVehicles);
 
-        // Save allocation records.
+        // Store allocation records returned by the engine.
         setAllocations((previous) => [
           ...previous,
           ...matchingResult.allocations,
         ]);
 
-        // Update the student's journey.
+        // Update journey with matched vehicle.
         setJourneys((previous) =>
           previous.map((journey) => {
             if (journey.id !== newJourneyId) {
@@ -254,32 +346,34 @@ export function MobilityProvider({ children }) {
 
               assignedVehicleId: match.id,
 
-              trackingSteps: journey.trackingSteps.map(
-                (step) => {
-                  if (step.id === 2) {
-                    return {
-                      ...step,
+              trackingSteps: journey.trackingSteps.map((step) => {
+                if (step.id === 2) {
+                  return {
+                    ...step,
 
-                      time: new Date().toLocaleTimeString(
-                        [],
-                        {
-                          hour: '2-digit',
-                          minute: '2-digit',
-                        }
-                      ),
+                    time: new Date().toLocaleTimeString([], {
+                      hour: '2-digit',
+                      minute: '2-digit',
+                    }),
 
-                      done: true,
+                    done: true,
 
-                      desc: `Matched with ${match.driverName} (${match.vehicleType})`,
-                    };
-                  }
-
-                  return step;
+                    desc: `Matched with ${match.driverName} (${match.vehicleType})`,
+                  };
                 }
-              ),
+
+                return step;
+              }),
             };
           })
         );
+
+        addActivityLog({
+          type: 'allocation',
+          title: 'Auto Match Completed',
+          description: `${studentProfile.name} matched with ${match.driverName} (${match.vehicleNumber})`,
+          severity: 'success',
+        });
 
         showAlert(
           `Community ride matched! Driver: ${match.driverName}`,
@@ -337,7 +431,12 @@ export function MobilityProvider({ children }) {
 
             const restoredSeats =
               Number(vehicle.availableSeats) +
-              allocation.passengerCount;
+              Number(
+                allocation.passengerCount ??
+                allocation.passengers ??
+                journey.passengers ??
+                1
+              );
 
             return {
               ...vehicle,
@@ -360,7 +459,9 @@ export function MobilityProvider({ children }) {
 
     setJourneys((previous) =>
       previous.map((item) => {
-        if (item.id !== journeyId) return item;
+        if (item.id !== journeyId) {
+          return item;
+        }
 
         return {
           ...item,
@@ -383,6 +484,13 @@ export function MobilityProvider({ children }) {
       })
     );
 
+    addActivityLog({
+      type: 'request',
+      title: 'Journey Cancelled',
+      description: `Journey ${journeyId} was cancelled: ${cancelReason}`,
+      severity: 'warning',
+    });
+
     showAlert(
       `Journey ${journeyId} was cancelled.`,
       'warning'
@@ -404,13 +512,10 @@ export function MobilityProvider({ children }) {
           ...journey.trackingSteps,
         ];
 
-        const timeNow = new Date().toLocaleTimeString(
-          [],
-          {
-            hour: '2-digit',
-            minute: '2-digit',
-          }
-        );
+        const timeNow = new Date().toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+        });
 
         if (nextStatus === 'in-progress') {
           updatedSteps = updatedSteps.map((step) => {
@@ -442,6 +547,13 @@ export function MobilityProvider({ children }) {
       })
     );
 
+    addActivityLog({
+      type: 'journey',
+      title: 'Journey Status Updated',
+      description: `Journey ${journeyId} updated to ${nextStatus}`,
+      severity: 'info',
+    });
+
     showAlert(
       `Journey ${journeyId} updated to: ${nextStatus}`
     );
@@ -460,6 +572,13 @@ export function MobilityProvider({ children }) {
       showAlert('Journey not found.', 'warning');
       return;
     }
+
+    addActivityLog({
+      type: 'emergency',
+      title: 'Emergency SOS Activated',
+      description: `SOS activated for journey ${journeyId}`,
+      severity: 'critical',
+    });
 
     showAlert(
       `EMERGENCY SOS ACTIVATED! Alert dispatched to ${studentProfile.emergencyContact?.name || 'Emergency Contact'} (${studentProfile.emergencyContact?.phone || 'Phone unavailable'}) and Campus Security!`,
@@ -496,6 +615,7 @@ export function MobilityProvider({ children }) {
     ]);
 
     showAlert('Community vehicle registered successfully!');
+
     return newVehicle.id;
   };
 
@@ -530,24 +650,130 @@ export function MobilityProvider({ children }) {
   };
 
   // --------------------------------------------------
+  // VEHICLE BREAKDOWN AND REALLOCATION - MEMBER 3
+  // --------------------------------------------------
+
+  const simulateBreakdown = async (vehicleId, options = {}) => {
+    try {
+      const result = await runDisruptionWorkflow(
+        vehicleId,
+        {
+          requests: journeys,
+          vehicles,
+          allocations,
+        },
+        options
+      );
+
+      // Update application state using workflow results.
+      setVehicles(result.updatedVehicles);
+      setJourneys(result.updatedRequests);
+
+      setAllocations((previous) => [
+        ...previous.filter(
+          (allocation) => allocation.vehicleId !== vehicleId
+        ),
+        ...result.newAllocations,
+      ]);
+
+      setDisruptions((previous) => [
+        result.disruptionRecord,
+        ...previous,
+      ]);
+
+      if (result.activityLog) {
+        addActivityLog(result.activityLog);
+      }
+
+      setLastDisruptionResult(result);
+
+      const msg =
+        result.summary.studentsUnallocated > 0
+          ? `Breakdown handled! ${result.summary.studentsReassigned} students reassigned, ${result.summary.studentsUnallocated} unallocated.`
+          : `Breakdown handled! All ${result.summary.studentsReassigned} students successfully reassigned.`;
+
+      showAlert(
+        msg,
+        result.summary.studentsUnallocated > 0
+          ? 'warning'
+          : 'info'
+      );
+
+      return result;
+    } catch (error) {
+      console.error('Breakdown simulation error:', error);
+
+      showAlert(
+        `Error executing breakdown: ${error.message}`,
+        'danger'
+      );
+
+      throw error;
+    }
+  };
+
+  // --------------------------------------------------
+  // REPAIR VEHICLE - MEMBER 3
+  // --------------------------------------------------
+
+  const repairVehicle = (vehicleId) => {
+    const updated = resolveVehicleBreakdown(
+      vehicleId,
+      vehicles
+    );
+
+    setVehicles(updated);
+
+    addActivityLog({
+      type: 'vehicle',
+      title: 'Vehicle Repaired & Activated',
+      description: `Vehicle ${vehicleId} marked repaired and returned to active fleet.`,
+      severity: 'success',
+    });
+
+    showAlert(
+      `Vehicle ${vehicleId} has been repaired and returned to service.`,
+      'success'
+    );
+  };
+
+  // --------------------------------------------------
   // DISRUPTION LOGGING - MEMBER 3
   // --------------------------------------------------
 
   const logDisruption = async (disruptionData) => {
-    const result = await broadcastDisruption(
-      disruptionData
-    );
+    try {
+      const result = await broadcastDisruption(disruptionData);
 
-    if (result?.disruption) {
-      setDisruptions((previous) => [
-        result.disruption,
-        ...previous,
-      ]);
+      if (result?.disruption) {
+        setDisruptions((previous) => [
+          result.disruption,
+          ...previous,
+        ]);
+
+        addActivityLog({
+          type: 'disruption',
+          title: `Disruption: ${result.disruption.routeNumber}`,
+          description: `${result.disruption.affectedSegment} - ${result.disruption.type}`,
+          severity: 'critical',
+        });
+
+        showAlert(
+          `Transit Disruption logged for ${result.disruption.routeNumber}`,
+          'warning'
+        );
+      }
+
+      return result;
+    } catch (error) {
+      console.error('Disruption logging error:', error);
 
       showAlert(
-        `Transit Disruption logged for ${result.disruption.routeNumber}`,
-        'warning'
+        'Unable to log the transit disruption.',
+        'danger'
       );
+
+      throw error;
     }
   };
 
@@ -563,6 +789,13 @@ export function MobilityProvider({ children }) {
           : disruption
       )
     );
+
+    addActivityLog({
+      type: 'disruption',
+      title: 'Disruption Resolved',
+      description: `Disruption ID ${disruptionId} marked as resolved.`,
+      severity: 'success',
+    });
 
     showAlert(
       `Disruption ${disruptionId} marked as resolved.`,
@@ -581,13 +814,17 @@ export function MobilityProvider({ children }) {
     localStorage.removeItem('sanchaari_allocations');
     localStorage.removeItem('sanchaari_disruptions');
     localStorage.removeItem('sanchaari_buses');
+    localStorage.removeItem('sanchaari_activity_logs');
+    localStorage.removeItem('sanchaari_last_disruption');
 
     setStudentProfile(DEFAULT_STUDENT_PROFILE);
     setJourneys(INITIAL_JOURNEYS);
     setVehicles(INITIAL_VEHICLES);
-    setAllocations([]);
+    setAllocations(INITIAL_ALLOCATIONS);
     setDisruptions(INITIAL_DISRUPTIONS);
     setBusSchedules(INITIAL_BUS_SCHEDULES);
+    setActivityLogs(INITIAL_ACTIVITY_LOGS);
+    setLastDisruptionResult(null);
 
     showAlert(
       'Application state reset to initial demo seeds!',
@@ -621,6 +858,7 @@ export function MobilityProvider({ children }) {
     // Matching allocations
     allocations,
     setAllocations,
+    updateAllocation,
 
     // Disruptions
     disruptions,
@@ -637,6 +875,18 @@ export function MobilityProvider({ children }) {
 
     // Reset
     resetAllData,
+
+    // Member 3 admin utilities
+    requests: journeys,
+    setRequests: setJourneys,
+    updateRequest,
+    buses: busSchedules,
+    activityLogs,
+    addActivityLog,
+    simulateBreakdown,
+    repairVehicle,
+    lastDisruptionResult,
+    setLastDisruptionResult,
   };
 
   return (
@@ -645,6 +895,10 @@ export function MobilityProvider({ children }) {
     </MobilityContext.Provider>
   );
 }
+
+// --------------------------------------------------
+// CUSTOM HOOK
+// --------------------------------------------------
 
 export function useMobility() {
   const context = useContext(MobilityContext);

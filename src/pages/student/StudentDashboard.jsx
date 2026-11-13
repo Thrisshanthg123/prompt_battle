@@ -216,6 +216,13 @@ export default function StudentDashboard() {
                     <span className="text-[10px] text-slate-500">Reported: {disruption.reportedAt}</span>
                     <Link
                       to="/request-journey"
+                      state={{
+                        busNumber: disruption.routeNumber,
+                        pickupLocation: disruption.affectedSegment || 'Mavoor Road Bus Stand',
+                        reason: `Public Bus Breakdown (${disruption.routeNumber})`,
+                        notes: `Stranded at ${disruption.affectedSegment} due to ${disruption.type}. ${disruption.advice}`,
+                        urgency: disruption.severity === 'High' ? 'High' : 'Medium',
+                      }}
                       className="text-xs font-bold text-emerald-800 hover:text-emerald-950 flex items-center gap-1"
                     >
                       <span>Join Pool</span>
