@@ -1,21 +1,24 @@
 import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import { Send, MapPin, Users, AlertCircle, Sparkles, Clock, Check, Bus } from 'lucide-react';
 import { useMobility } from '../../context/MobilityContext';
 
 export default function JourneyRequestForm() {
   const navigate = useNavigate();
+  const location = useLocation();
+  const navState = location.state || {};
+
   const { createJourneyRequest, studentProfile, disruptions, busSchedules } = useMobility();
 
   const [formData, setFormData] = useState({
-    pickupLocation: 'Mavoor Road Bus Stand',
-    destinationLocation: studentProfile.collegeStop || 'GECK Campus Main Gate',
-    reason: 'Public Bus Breakdown (Route #42)',
-    urgency: 'High',
-    passengers: 1,
+    pickupLocation: navState.pickupLocation || 'Mavoor Road Bus Stand',
+    destinationLocation: navState.destinationLocation || studentProfile.collegeStop || 'GECK Campus Main Gate',
+    reason: navState.reason || 'Public Bus Breakdown (Route #42)',
+    urgency: navState.urgency || 'High',
+    passengers: navState.passengers || 1,
     scheduledTime: 'Immediate (Next 10 mins)',
-    busNumber: 'Route 42',
-    notes: 'Stranded near platform 3 following bus engine breakdown.',
+    busNumber: navState.busNumber || 'Route 42',
+    notes: navState.notes || 'Stranded near platform 3 following bus engine breakdown.',
   });
 
   const [isSubmitting, setIsSubmitting] = useState(false);
