@@ -59,7 +59,7 @@ export default function Sidebar() {
   ];
 
   return (
-    <aside className="w-full md:w-64 bg-white border-r border-slate-200/80 p-4 flex flex-col justify-between min-h-[calc(100vh-4rem)]">
+    <aside className="hidden md:flex md:w-64 bg-white border-r border-slate-200/80 p-4 flex-col justify-between min-h-[calc(100vh-4rem)] shrink-0">
       <div className="space-y-6">
         {/* Section: Member 1 - Student Mobility Hub */}
         <div>
