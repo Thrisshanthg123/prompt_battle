@@ -1,306 +1,415 @@
-/**
- * ============================================================================
- * SANCHAARI - MEMBER 2 AI MATCHING ENGINE CONTRACT & IMPLEMENTATION
- * ============================================================================
- * 
- * File: src/services/matchingEngine.js
- * Assigned Owner: MEMBER 2 (Community Vehicle Portal & AI Matching Engine)
- * Reused by: MEMBER 3 (Disruption Management & Automatic Reallocation)
- * 
- * Contract:
- * export function runMatching({ requests, vehicles, existingAllocations })
- * 
- * Returns:
- * {
- *   allocations: Array,
- *   updatedRequests: Array,
- *   updatedVehicles: Array,
- *   unallocatedRequests: Array,
- *   summary: {
- *     totalRequests: number,
- *     allocatedRequests: number,
- *     unallocatedRequests: number,
- *     studentsAllocated: number,
- *     studentsUnallocated: number
- *   }
- * }
- */
 
-/**
- * Geographic corridor distance/proximity heuristic matrix for Kozhikode rural hubs.
- * Score is between 0 (distant/incompatible) and 1.0 (exact corridor match).
- */
-const CORRIDOR_PROXIMITY_MATRIX = {
-  'Mavoor Road': {
-    'Mavoor Road': 1.0,
-    'Mavoor Road Bus Stand': 1.0,
-    'Medical College': 0.85,
-    'Kunnamangalam': 0.7,
-    'GECK Campus': 0.65,
-    'Karanthur': 0.6,
-  },
-  'Kunnamangalam': {
-    'Kunnamangalam': 1.0,
-    'Kunnamangalam Junction': 1.0,
-    'Kunnamangalam Bus Bay': 1.0,
-    'GECK Campus': 0.95,
-    'GECK Campus Main Gate': 0.95,
-    'NIT Calicut': 0.9,
-    'Karanthur': 0.85,
-    'Kuttikkattoor': 0.75,
-    'Mavoor Road': 0.7,
-  },
-  'GECK Campus': {
-    'GECK Campus': 1.0,
-    'GECK Campus Main Gate': 1.0,
-    'Kunnamangalam': 0.95,
-    'NIT Calicut': 0.9,
-    'Medical College': 0.7,
-  },
-  'Medical College': {
-    'Medical College': 1.0,
-    'Medical College Junction': 1.0,
-    'Mavoor Road': 0.85,
-    'Kunnamangalam': 0.7,
-    'GECK Campus': 0.7,
-    'Palayam': 0.8,
-  },
-  'Palayam': {
-    'Palayam': 1.0,
-    'Palayam Bus Stand': 1.0,
-    'Central Railway Station': 0.95,
-    'Medical College': 0.8,
-    'Mavoor Road': 0.75,
-  },
-};
+const normalize = (value) =>
+  String(value ?? '').trim().toLowerCase();
 
-/**
- * Calculates corridor proximity score between request pickup/destination and vehicle base/corridor.
- */
-function calculateProximityScore(request, vehicle) {
-  const reqLoc = request.pickupLocation || request.village || '';
-  const vehLoc = vehicle.baseLocation || vehicle.currentLocation || '';
+const parseTime = (value) => {
+  if (!value) return null;
 
-  // Direct string inclusion
-  if (vehLoc && reqLoc && (vehLoc.toLowerCase().includes(reqLoc.toLowerCase()) || reqLoc.toLowerCase().includes(vehLoc.toLowerCase()))) {
-    return 1.0;
+  const match = String(value).match(
+    /(?:^|\s)(\d{1,2}):(\d{2})\s*(AM|PM)?/i
+  );
+
+  if (!match) return null;
+
+  let hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  const period = match[3]?.toUpperCase();
+
+  if (minutes > 59) return null;
+
+  if (period) {
+    if (hours < 1 || hours > 12) return null;
+
+    if (period === 'PM' && hours !== 12) hours += 12;
+    if (period === 'AM' && hours === 12) hours = 0;
+  } else if (hours > 23) {
+    return null;
   }
 
-  // Look up closest corridor in matrix
-  for (const [corridorA, matches] of Object.entries(CORRIDOR_PROXIMITY_MATRIX)) {
-    if (reqLoc.toLowerCase().includes(corridorA.toLowerCase())) {
-      for (const [corridorB, score] of Object.entries(matches)) {
-        if (vehLoc.toLowerCase().includes(corridorB.toLowerCase())) {
-          return score;
-        }
-      }
+  return hours * 60 + minutes;
+};
+
+const getRouteStops = (vehicle) => {
+  if (Array.isArray(vehicle.routePoints) && vehicle.routePoints.length > 0) {
+    return vehicle.routePoints
+      .map((point) => {
+        if (typeof point === 'string') return normalize(point);
+        return normalize(point?.location || point?.name);
+      })
+      .filter(Boolean);
+  }
+
+  return [
+    vehicle.currentLocation || vehicle.baseLocation,
+    ...(vehicle.intermediateStops || []),
+    vehicle.destination,
+  ]
+    .filter(Boolean)
+    .map(normalize);
+};
+
+const checkRoute = (request, vehicle) => {
+  const stops = getRouteStops(vehicle);
+
+  if (stops.length < 2) {
+    return {
+      eligible: false,
+      reason: 'Vehicle route information is incomplete',
+    };
+  }
+
+  const pickup = normalize(request.pickupLocation);
+  const destination = normalize(
+    request.junction || request.destinationLocation
+  );
+
+  if (!pickup || !destination) {
+    return {
+      eligible: false,
+      reason: 'Student pickup or destination is missing',
+    };
+  }
+
+  const pickupIndex = stops.indexOf(pickup);
+  const destinationIndex = stops.indexOf(destination);
+
+  if (pickupIndex === -1 || destinationIndex === -1) {
+    return {
+      eligible: false,
+      reason: 'Pickup or destination is not on the vehicle route',
+    };
+  }
+
+  if (destinationIndex <= pickupIndex) {
+    return {
+      eligible: false,
+      reason: 'Vehicle route travels in the wrong direction',
+    };
+  }
+
+  const routeScore =
+    destinationIndex === pickupIndex + 1 ? 1 : 0.8;
+
+  return {
+    eligible: true,
+    score: routeScore,
+  };
+};
+
+const checkTime = (request, vehicle) => {
+  const departure = parseTime(vehicle.departureTime);
+
+  // scheduledTime represents the requested pickup time.
+  const requestedPickup = parseTime(
+    request.pickupTime || request.scheduledTime
+  );
+
+  const travelToPickup = Number(
+    vehicle.estimatedTravelMinutesToPickup
+  );
+
+  const travelToDestination = Number(
+    vehicle.estimatedTravelMinutesToDestination
+  );
+
+  if (
+    departure === null ||
+    requestedPickup === null ||
+    !Number.isFinite(travelToPickup) ||
+    !Number.isFinite(travelToDestination) ||
+    travelToPickup < 0 ||
+    travelToDestination < 0
+  ) {
+    return {
+      eligible: false,
+      reason: 'Departure time or travel duration is missing',
+    };
+  }
+
+  const pickupArrival = departure + travelToPickup;
+
+  // Allow a pickup deadline after midnight when appropriate.
+  let pickupDeadline = requestedPickup;
+
+  while (pickupDeadline < departure) {
+    pickupDeadline += 1440;
+  }
+
+  if (pickupArrival > pickupDeadline) {
+    return {
+      eligible: false,
+      reason: 'Vehicle cannot reach the pickup on time',
+    };
+  }
+
+  const destinationArrival =
+    pickupArrival + travelToDestination;
+
+  if (request.arrivalTime) {
+    let destinationDeadline = parseTime(request.arrivalTime);
+
+    if (destinationDeadline === null) {
+      return {
+        eligible: false,
+        reason: 'Student arrival deadline is invalid',
+      };
+    }
+
+    while (destinationDeadline < departure) {
+      destinationDeadline += 1440;
+    }
+
+    if (destinationArrival > destinationDeadline) {
+      return {
+        eligible: false,
+        reason: 'Vehicle cannot reach the destination before the deadline',
+      };
     }
   }
 
-  // Baseline general rural proximity
-  return 0.5;
-}
+  const waitingMinutes = pickupDeadline - pickupArrival;
 
-/**
- * Runs the matching engine to allocate pending student requests to eligible community vehicles.
- *
- * Rules:
- * 1. Only verified, active, non-breakdown vehicles are eligible.
- * 2. Never exceed vehicle availableSeats.
- * 3. Prioritizes requests by Urgency (High > Medium > Low) and creation timestamp.
- * 4. Scores candidate vehicles based on capacity fit, route proximity, and driver rating.
- * 5. Returns updated requests, updated vehicles, new allocations, and a comprehensive summary.
- *
- * @param {Object} params
- * @param {Array} params.requests - List of journey requests to match
- * @param {Array} params.vehicles - List of community vehicles
- * @param {Array} [params.existingAllocations=[]] - Active allocations
- * @returns {Object} Matching results contract
- */
+  return {
+    eligible: true,
+    score: Math.max(0, 1 - waitingMinutes / 120),
+    departureScore: Math.max(
+      0,
+      1 - Math.abs(departure - pickupDeadline) / 180
+    ),
+  };
+};
+
+const checkVehicle = (request, vehicle) => {
+  if (vehicle.verified !== true) {
+    return {
+      eligible: false,
+      reason: 'Vehicle is not verified',
+    };
+  }
+
+  if (vehicle.legalEligibility !== true) {
+    return {
+      eligible: false,
+      reason: 'Legal passenger eligibility is not confirmed',
+    };
+  }
+
+  if (vehicle.willingnessConfirmed !== true) {
+    return {
+      eligible: false,
+      reason: 'Owner willingness is not confirmed',
+    };
+  }
+
+  if (vehicle.status !== 'available') {
+    return {
+      eligible: false,
+      reason: 'Vehicle is not available',
+    };
+  }
+
+  const passengers = Number(request.passengers ?? 1);
+  const seats = Number(vehicle.availableSeats);
+
+  if (!Number.isInteger(passengers) || passengers < 1) {
+    return {
+      eligible: false,
+      reason: 'Invalid passenger count',
+    };
+  }
+
+  if (!Number.isInteger(seats) || seats < passengers) {
+    return {
+      eligible: false,
+      reason: 'Insufficient available seats',
+    };
+  }
+
+  const route = checkRoute(request, vehicle);
+
+  if (!route.eligible) return route;
+
+  const time = checkTime(request, vehicle);
+
+  if (!time.eligible) return time;
+
+  // Prefer vehicles that use their available seats efficiently.
+  const capacityScore = passengers / seats;
+
+  // Weighted deterministic matching score.
+  const score =
+    0.4 * route.score +
+    0.3 * time.score +
+    0.2 * capacityScore +
+    0.1 * time.departureScore;
+
+  return {
+    eligible: true,
+    score: Number(score.toFixed(4)),
+    scoreBreakdown: {
+      route: Number(route.score.toFixed(2)),
+      timing: Number(time.score.toFixed(2)),
+      capacity: Number(capacityScore.toFixed(2)),
+      departure: Number(time.departureScore.toFixed(2)),
+    },
+    explanation: [
+      'Vehicle is verified.',
+      'Legal passenger eligibility is confirmed.',
+      'Owner has confirmed willingness.',
+      'Vehicle route is compatible with the requested journey.',
+      'Available seats satisfy the passenger requirement.',
+      'Travel timing satisfies the pickup and arrival constraints.',
+    ],
+  };
+};
+
 export function runMatching({
   requests = [],
   vehicles = [],
   existingAllocations = [],
-}) {
+} = {}) {
+  if (!Array.isArray(requests) || !Array.isArray(vehicles)) {
+    throw new TypeError('Requests and vehicles must be arrays');
+  }
+
+  if (!Array.isArray(existingAllocations)) {
+    throw new TypeError('Existing allocations must be an array');
+  }
+
+  const updatedVehicles = vehicles.map((vehicle) => ({
+    ...vehicle,
+  }));
+
+  const updatedRequests = requests.map((request) => ({
+    ...request,
+  }));
+
   const allocations = [];
-  const updatedRequests = [];
   const unallocatedRequests = [];
 
-  // Deep clone vehicles to track capacity mutations safely
-  const updatedVehiclesMap = new Map();
-  vehicles.forEach((v) => {
-    updatedVehiclesMap.set(v.id, {
-      ...v,
-      availableSeats: Number(v.availableSeats ?? v.capacity ?? 0),
-    });
-  });
-
-  // Filter requests that require allocation:
-  // Must be 'requested', 'unallocated', 'pending', or reallocating
-  const pendingRequests = requests.filter(
-    (r) => r.status === 'requested' || r.status === 'unallocated' || r.status === 'pending' || r.isReallocating
+  // Protect requests that already have an allocation.
+  const alreadyAllocated = new Set(
+    existingAllocations
+      .map((allocation) => allocation.requestId)
+      .filter(Boolean)
   );
 
-  // Sort requests by urgency (High -> Medium -> Low) then by date
-  const urgencyWeight = { High: 3, Medium: 2, Low: 1 };
-  const sortedRequests = [...pendingRequests].sort((a, b) => {
-    const uA = urgencyWeight[a.urgency] || 1;
-    const uB = urgencyWeight[b.urgency] || 1;
-    if (uB !== uA) return uB - uA;
-    return new Date(a.createdAt || 0) - new Date(b.createdAt || 0);
-  });
+  const pendingRequests = updatedRequests
+    .filter(
+      (request) =>
+        ['requested', 'pending'].includes(request.status) &&
+        !alreadyAllocated.has(request.id)
+    )
+    .sort((a, b) => {
+      const priority = { High: 3, Medium: 2, Low: 1 };
 
-  // Eligible vehicles filter:
-  // Must be verified, not in breakdown, not unavailable/offline, and have seats > 0
-  const isVehicleEligible = (veh) => {
-    if (!veh) return false;
-    if (veh.verified === false) return false; // Strict legal & verification check
-    if (veh.status === 'breakdown' || veh.status === 'unavailable' || veh.status === 'offline') return false;
-    return (veh.availableSeats || 0) > 0;
-  };
+      const priorityDifference =
+        (priority[b.urgency] || 0) -
+        (priority[a.urgency] || 0);
 
-  const currentTimeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      if (priorityDifference !== 0) {
+        return priorityDifference;
+      }
 
-  // Process matching
-  for (const req of sortedRequests) {
-    const requiredSeats = Number(req.passengers || 1);
+      return String(a.id).localeCompare(String(b.id));
+    });
 
-    // Find candidate vehicles with sufficient seats
-    const candidates = Array.from(updatedVehiclesMap.values()).filter(
-      (veh) => isVehicleEligible(veh) && veh.availableSeats >= requiredSeats
-    );
-
-    if (candidates.length === 0) {
-      // No vehicle can accommodate this request
-      const unallocReq = {
-        ...req,
-        status: 'unallocated',
-        matchedVehicle: null,
-        unallocatedReason: 'No verified community vehicle with sufficient capacity available',
-      };
-      updatedRequests.push(unallocReq);
-      unallocatedRequests.push(unallocReq);
+  for (const request of pendingRequests) {
+    if (!request.id) {
+      unallocatedRequests.push({
+        ...request,
+        reason: 'Request ID is missing',
+      });
       continue;
     }
 
-    // Score candidates based on:
-    // 1. Proximity score (0 to 10 points)
-    // 2. Capacity fit (tightest fit preferred to preserve large vehicles, 0 to 5 points)
-    // 3. Driver rating (0 to 5 points)
-    const scoredCandidates = candidates.map((veh) => {
-      const proximityScore = calculateProximityScore(req, veh) * 10;
-      // Best fit: smaller positive difference between available seats and required seats
-      const seatSurplus = veh.availableSeats - requiredSeats;
-      const fitScore = Math.max(0, 5 - seatSurplus * 0.5);
-      const ratingScore = Number(veh.rating || 4.5);
+    const candidates = updatedVehicles
+      .map((vehicle) => ({
+        vehicle,
+        result: checkVehicle(request, vehicle),
+      }))
+      .filter((candidate) => candidate.result.eligible)
+      .sort(
+        (a, b) =>
+          b.result.score - a.result.score ||
+          String(a.vehicle.id).localeCompare(String(b.vehicle.id))
+      );
 
-      const totalScore = proximityScore + fitScore + ratingScore;
+    const best = candidates[0];
 
-      return { vehicle: veh, score: totalScore };
-    });
-
-    // Select candidate with highest score
-    scoredCandidates.sort((a, b) => b.score - a.score);
-    const selectedVehicle = scoredCandidates[0].vehicle;
-
-    // Deduct seats
-    selectedVehicle.availableSeats -= requiredSeats;
-    if (selectedVehicle.availableSeats === 0) {
-      selectedVehicle.status = 'on-trip';
-    } else {
-      selectedVehicle.status = selectedVehicle.status === 'on-trip' ? 'on-trip' : 'available';
+    if (!best) {
+      unallocatedRequests.push({
+        ...request,
+        reason: 'No vehicle satisfies all matching requirements',
+      });
+      continue;
     }
-    updatedVehiclesMap.set(selectedVehicle.id, selectedVehicle);
 
-    // Create allocation
-    const allocationId = `ALC-${Date.now().toString().slice(-4)}-${Math.floor(100 + Math.random() * 900)}`;
-    const newAllocation = {
-      id: allocationId,
-      requestId: req.id,
-      studentId: req.studentId || 'STU-GEN',
-      studentName: req.studentName || 'Student Passenger',
-      pickupLocation: req.pickupLocation || req.village,
-      destinationLocation: req.destinationLocation,
-      passengers: requiredSeats,
-      vehicleId: selectedVehicle.id,
-      driverName: selectedVehicle.driverName,
-      driverPhone: selectedVehicle.driverPhone,
-      vehicleType: selectedVehicle.vehicleType,
-      vehicleNumber: selectedVehicle.vehicleNumber,
-      allocatedAt: new Date().toISOString(),
-      status: 'active',
-      eta: selectedVehicle.eta || '6-9 mins away',
+    const vehicle = best.vehicle;
+    const passengers = Number(request.passengers ?? 1);
+
+    // Reserve seats without modifying the original input.
+    vehicle.availableSeats -= passengers;
+
+    if (vehicle.availableSeats === 0) {
+      vehicle.status = 'on-trip';
+    }
+
+    const allocation = {
+      id: `ALLOC-${request.id}-${vehicle.id}`,
+      requestId: request.id,
+      vehicleId: vehicle.id,
+      passengerCount: passengers,
+      score: best.result.score,
+      scoreBreakdown: best.result.scoreBreakdown,
+      explanation: best.result.explanation,
     };
-    allocations.push(newAllocation);
 
-    // Update request
-    const matchedReq = {
-      ...req,
+    allocations.push(allocation);
+    alreadyAllocated.add(request.id);
+
+    const requestIndex = updatedRequests.findIndex(
+      (item) => item.id === request.id
+    );
+
+    updatedRequests[requestIndex] = {
+      ...request,
       status: 'matched',
-      isReallocating: false,
+      assignedVehicleId: vehicle.id,
       matchedVehicle: {
-        id: selectedVehicle.id,
-        driverName: selectedVehicle.driverName,
-        driverPhone: selectedVehicle.driverPhone,
-        vehicleType: selectedVehicle.vehicleType,
-        vehicleNumber: selectedVehicle.vehicleNumber,
-        rating: selectedVehicle.rating,
-        totalTrips: selectedVehicle.totalTrips || 140,
-        eta: selectedVehicle.eta || '6-9 mins away',
-        liveLocation: selectedVehicle.liveLocation || `En route to ${req.pickupLocation}`,
+        id: vehicle.id,
+        driverName: vehicle.driverName || vehicle.ownerName,
+        driverPhone: vehicle.driverPhone || vehicle.contactNumber,
+        vehicleType: vehicle.vehicleType,
+        vehicleNumber:
+          vehicle.vehicleNumber || vehicle.registrationNumber,
       },
-      trackingSteps: Array.isArray(req.trackingSteps)
-        ? req.trackingSteps.map((step) => {
-            if (step.id === 2) {
-              return {
-                ...step,
-                done: true,
-                time: currentTimeStr,
-                desc: `Matched with ${selectedVehicle.driverName} (${selectedVehicle.vehicleNumber})`,
-              };
-            }
-            return step;
-          })
-        : [
-            { id: 1, label: 'Ride Requested', done: true, time: currentTimeStr },
-            { id: 2, label: 'Community Driver Matched', done: true, time: currentTimeStr, desc: `Matched with ${selectedVehicle.driverName}` },
-            { id: 3, label: 'Driver Arrived at Pickup', done: false, time: '--' },
-            { id: 4, label: 'En Route to Destination', done: false, time: '--' },
-            { id: 5, label: 'Trip Completed', done: false, time: '--' },
-          ],
     };
-    updatedRequests.push(matchedReq);
   }
 
-  // Include any other non-pending requests in updatedRequests unchanged
-  const otherRequests = requests.filter(
-    (r) => !pendingRequests.some((p) => p.id === r.id)
+  const studentsAllocated = allocations.reduce(
+    (total, allocation) =>
+      total + allocation.passengerCount,
+    0
   );
-  const allFinalRequests = [...updatedRequests, ...otherRequests];
 
-  // Calculate summary metrics
-  const studentsAllocated = updatedRequests
-    .filter((r) => r.status === 'matched')
-    .reduce((sum, r) => sum + Number(r.passengers || 1), 0);
-
-  const studentsUnallocated = unallocatedRequests
-    .reduce((sum, r) => sum + Number(r.passengers || 1), 0);
-
-  const summary = {
-    totalRequests: pendingRequests.length,
-    allocatedRequests: allocations.length,
-    unallocatedRequests: unallocatedRequests.length,
-    studentsAllocated,
-    studentsUnallocated,
-  };
+  const studentsUnallocated = unallocatedRequests.reduce(
+    (total, request) =>
+      total + Number(request.passengers ?? 1),
+    0
+  );
 
   return {
     allocations,
-    updatedRequests: allFinalRequests,
-    updatedVehicles: Array.from(updatedVehiclesMap.values()),
+    updatedRequests,
+    updatedVehicles,
     unallocatedRequests,
-    summary,
+    summary: {
+      totalRequests: pendingRequests.length,
+      allocatedRequests: allocations.length,
+      unallocatedRequests: unallocatedRequests.length,
+      studentsAllocated,
+      studentsUnallocated,
+    },
   };
 }
-
-export default runMatching;
